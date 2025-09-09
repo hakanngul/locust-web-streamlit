@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Streamlit
+.streamlit/
+
+# Runs and outputs
+runs/
+*.log
+.env
+
+# Envs
+.venv/
+venv/
+env/

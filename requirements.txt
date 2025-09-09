@@ -1,0 +1,6 @@
+streamlit>=1.32
+locust>=2.25
+pandas>=2.0
+plotly>=5.20
+python-dotenv>=1.0
+watchdog
