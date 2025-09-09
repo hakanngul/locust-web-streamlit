@@ -1,0 +1,14 @@
+{
+  "selected_file": "locustfiles/reqres_locustfile.py",
+  "use_file_host": true,
+  "host": "http://localhost:8000",
+  "users": 10,
+  "spawn": 2,
+  "run_time": "1m",
+  "html_report": true,
+  "csv_full_history": true,
+  "csv_prefix": "stats",
+  "loglevel": "WARNING",
+  "csv_flush_interval": 0,
+  "stream_logs": true
+}
