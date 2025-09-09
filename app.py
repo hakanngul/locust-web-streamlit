@@ -3,6 +3,7 @@ import sys
 import shutil
 import subprocess
 from datetime import datetime
+import time
 from pathlib import Path
 import json
 import re
@@ -93,6 +94,9 @@ def run_locust(
     csv_prefix: str = "stats",
     html_report: bool = True,
     csv_full_history: bool = True,
+    loglevel: str = "WARNING",
+    csv_flush_interval: Optional[int] = None,
+    stream_logs: bool = True,
 ):
     run_dir.mkdir(parents=True, exist_ok=True)
     logfile = run_dir / "locust.log"
@@ -118,16 +122,20 @@ def run_locust(
     ]
     if host:
         cmd += ["--host", str(host)]
+    if loglevel:
+        cmd += ["--loglevel", loglevel]
     if html_report:
         cmd += ["--html", str(html_path)]
     if csv_full_history:
         cmd += ["--csv-full-history"]
+    if csv_flush_interval:
+        cmd += ["--csv-flush-interval", str(int(csv_flush_interval))]
 
     start = datetime.utcnow().isoformat()
 
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=(subprocess.PIPE if stream_logs else subprocess.DEVNULL),
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
@@ -153,6 +161,26 @@ def load_stats(run_dir: Path, prefix: str = "stats"):
             except Exception:
                 pass
     return data
+
+
+@st.cache_data(show_spinner=False)
+def load_stats_cached(run_dir_str: str, prefix: str, sig: tuple):
+    # Cached wrapper using a signature of file mtimes/sizes to invalidate
+    return load_stats(Path(run_dir_str), prefix)
+
+
+def run_signature(run_dir: Path) -> tuple:
+    parts = []
+    try:
+        for p in sorted(run_dir.glob("*")):
+            try:
+                stt = p.stat()
+                parts.append((p.name, stt.st_mtime_ns, stt.st_size))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return tuple(parts)
 
 
 def render_summary_from_stats(stats_df: pd.DataFrame):
@@ -290,6 +318,9 @@ def main():
             html_report = st.checkbox("HTML raporu üret", value=default_html_report)
             csv_full_history = st.checkbox("CSV full history", value=default_csv_full_history)
             csv_prefix = st.text_input("CSV prefix", value=default_csv_prefix)
+            loglevel = st.selectbox("Log seviyesi", options=["ERROR", "WARNING", "INFO", "DEBUG"], index=1, help="Daha düşük seviye daha az çıktı ve daha hızlı UI")
+            csv_flush_interval = st.number_input("CSV flush interval (s)", min_value=0, value=0, help="0=Locust varsayılanı. Büyük dosyalarda 5-10 sn faydalı olabilir.")
+            stream_logs = st.checkbox("Canlı log akışı", value=True, help="Kapatırsanız performans artar, log dosyadan görülebilir.")
 
         run_btn = st.button(
             "Testi Başlat",
@@ -321,17 +352,29 @@ def main():
                 csv_prefix=csv_prefix,
                 html_report=html_report,
                 csv_full_history=csv_full_history,
+                loglevel=loglevel,
+                csv_flush_interval=(int(csv_flush_interval) if int(csv_flush_interval) > 0 else None),
+                stream_logs=stream_logs,
             )
 
             log_lines = []
             with st.spinner("Locust çalışıyor... Lütfen bekleyin"):
-                if proc.stdout is not None:
+                if stream_logs and proc.stdout is not None:
+                    last_update = 0.0
                     for line in proc.stdout:
                         log_lines.append(line.rstrip())
-                        # Show last ~200 lines to keep UI snappy
-                        to_show = "\n".join(log_lines[-200:])
-                        log_area.code(to_show)
+                        now = time.time()
+                        if now - last_update > 0.25:
+                            last_update = now
+                            to_show = "\n".join(log_lines[-200:])
+                            log_area.code(to_show)
                 proc.wait()
+                if not stream_logs:
+                    try:
+                        tail = (logfile.read_text(encoding="utf-8", errors="ignore").splitlines())[-200:]
+                        log_area.code("\n".join(tail))
+                    except Exception:
+                        pass
 
             st.session_state["running"] = False
             ended = datetime.utcnow().isoformat()
@@ -369,7 +412,7 @@ def main():
             run_opts = [str(p.relative_to(BASE_DIR)) for p in runs]
             sel = st.selectbox("Çalışma seçin", run_opts)
             selected_run = BASE_DIR / sel
-            data = load_stats(selected_run)
+            data = load_stats_cached(str(selected_run), "stats", run_signature(selected_run))
 
             # Show metadata if exists
             meta_path = selected_run / "metadata.json"
@@ -434,7 +477,7 @@ def main():
                     meta = json.loads(mp.read_text(encoding="utf-8"))
                 except Exception:
                     meta = {}
-            data = load_stats(r)
+            data = load_stats_cached(str(r), "stats", run_signature(r))
             agg = None
             if "stats" in data and not data["stats"].empty:
                 sdf = data["stats"]
