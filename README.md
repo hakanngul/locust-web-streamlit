@@ -33,3 +33,14 @@ streamlit run app.py
 - HTML raporu için "HTML raporu üret" seçeneğini işaretleyin.
 - Zaman serisi grafikleri için "CSV full history" seçeneği açık olmalıdır.
 
+## Eşikler ve Dashboard
+
+- `.env` ile eşik tanımlayabilirsiniz:
+  - `THRESHOLD_P95_MS=800` gibi
+  - `THRESHOLD_SUCCESS_RATE=99` gibi
+- Raporlar sekmesinde koşu özeti altında eşiklere göre uyarı/başarı rozetleri gösterilir.
+- Genel Dashboard sekmesinde filtreleme, gruplanmış özet ve grafikler bulunur; eşikler uygulanır.
+
+## Koşu Karşılaştırma
+
+- Raporlar sekmesinde seçili koşuyu başka bir koşu ile kıyaslayabilirsiniz.

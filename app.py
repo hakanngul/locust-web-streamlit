@@ -14,6 +14,7 @@ import plotly.express as px
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 import warnings
+from typing import Optional
 
 
 
@@ -32,6 +33,8 @@ RUNS_DIR = _resolve_dir("RUNS_DIR", "runs")
 LOCUSTFILES_DIR = _resolve_dir("LOCUSTFILES_DIR", "locustfiles")
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 LOCUSTFILES_DIR.mkdir(parents=True, exist_ok=True)
+PROFILES_DIR = BASE_DIR / "profiles"
+PROFILES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -39,6 +42,26 @@ def _env_bool(key: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(key: str) -> Optional[int]:
+    raw = os.getenv(key)
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _env_float(key: str) -> Optional[float]:
+    raw = os.getenv(key)
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except Exception:
+        return None
 
 
 # Optionally suppress urllib3 OpenSSL warnings (macOS LibreSSL noise)
@@ -51,15 +74,49 @@ if _env_bool("SUPPRESS_SSL_WARNINGS", False):
         pass
 
 
-from typing import Optional
-
-
 def which_locust() -> Optional[str]:
     return shutil.which("locust")
 
 
 def list_locustfiles() -> list[Path]:
     return sorted(LOCUSTFILES_DIR.glob("**/*.py"))
+
+
+# Profile helpers
+def _safe_profile_name(name: str) -> str:
+    # keep alnum, dash, underscore, dot
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name.strip())
+
+
+def list_profiles() -> list[str]:
+    return sorted([p.stem for p in PROFILES_DIR.glob("*.json")])
+
+
+def load_profile(name: str) -> Optional[dict]:
+    path = PROFILES_DIR / f"{_safe_profile_name(name)}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_profile(name: str, data: dict) -> Path:
+    path = PROFILES_DIR / f"{_safe_profile_name(name)}.json"
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path
+
+
+def delete_profile(name: str) -> bool:
+    path = PROFILES_DIR / f"{_safe_profile_name(name)}.json"
+    try:
+        if path.exists():
+            path.unlink()
+            return True
+    except Exception:
+        return False
+    return False
 
 
 def ensure_sample_locustfile():
@@ -233,6 +290,24 @@ def render_time_series(history_df: pd.DataFrame):
         st.plotly_chart(chart2, use_container_width=True)
 
 
+def aggregated_metrics(stats_df: pd.DataFrame) -> dict:
+    if stats_df is None or stats_df.empty:
+        return {}
+    name_col = "Name" if "Name" in stats_df.columns else ("name" if "name" in stats_df.columns else None)
+    if not name_col:
+        return {}
+    rows = stats_df[stats_df[name_col].astype(str).str.lower() == "aggregated"]
+    if rows.empty:
+        return {}
+    agg = rows.iloc[0]
+    req = int(agg.get("Request Count", agg.get("Requests", 0)) or 0)
+    fail = int(agg.get("Failure Count", agg.get("Failures", 0)) or 0)
+    median = float(agg.get("50%ile", agg.get("Median Response Time", agg.get("50%", float('nan')))))
+    p95 = float(agg.get("95%ile", agg.get("95%", float('nan'))))
+    success_rate = (1 - (fail / req)) * 100 if req > 0 else float('nan')
+    return {"requests": req, "failures": fail, "median_ms": median, "p95_ms": p95, "success_rate": success_rate}
+
+
 def list_runs() -> list[Path]:
     return sorted([p for p in RUNS_DIR.iterdir() if p.is_dir()], reverse=True)
 
@@ -273,7 +348,7 @@ def main():
 
         locustfiles = list_locustfiles()
         choices = [str(p.relative_to(BASE_DIR)) for p in locustfiles]
-        selected_file = st.selectbox("Locust dosyası", options=choices, index=0 if choices else None)
+        selected_file = st.selectbox("Locust dosyası", options=choices, index=0 if choices else None, key="ui_selected_file")
 
         # Defaults from .env
         default_host = os.getenv("LOCUST_HOST", "http://localhost:8000")
@@ -292,7 +367,7 @@ def main():
 
         selected_path = BASE_DIR / selected_file if selected_file else None
         has_file_host = bool(selected_path and locustfile_declares_host(selected_path))
-        use_file_host = st.checkbox("Host'u locustfile içinden kullan", value=has_file_host)
+        use_file_host = st.checkbox("Host'u locustfile içinden kullan", value=has_file_host, key="ui_use_file_host")
 
         file_host_val = extract_locustfile_host(selected_path) if selected_path else None
 
@@ -301,26 +376,74 @@ def main():
             value=default_host,
             disabled=use_file_host,
             help="Boş bırakılırsa ve üstteki seçenek açıksa locustfile'daki host kullanılır."
-        )
+        , key="ui_host")
 
         effective_host = (file_host_val if use_file_host else host) or ""
         st.caption(f"Etkin host: {effective_host if effective_host else '—'}" + (f" (dosyadan)" if use_file_host and file_host_val else ""))
         col1, col2, col3 = st.columns(3)
         with col1:
-            users = st.number_input("Kullanıcı sayısı (-u)", min_value=1, value=default_users)
+            users = st.number_input("Kullanıcı sayısı (-u)", min_value=1, value=default_users, key="ui_users")
         with col2:
-            spawn = st.number_input("Başlatma hızı/s (-r)", min_value=1, value=int(default_spawn))
+            spawn = st.number_input("Başlatma hızı/s (-r)", min_value=1, value=int(default_spawn), key="ui_spawn")
         with col3:
-            run_time = st.text_input("Çalışma süresi (--run-time)", value=default_run_time)
+            run_time = st.text_input("Çalışma süresi (--run-time)", value=default_run_time, key="ui_run_time")
 
         adv = st.expander("Gelişmiş Ayarlar", expanded=False)
         with adv:
-            html_report = st.checkbox("HTML raporu üret", value=default_html_report)
-            csv_full_history = st.checkbox("CSV full history", value=default_csv_full_history)
-            csv_prefix = st.text_input("CSV prefix", value=default_csv_prefix)
-            loglevel = st.selectbox("Log seviyesi", options=["ERROR", "WARNING", "INFO", "DEBUG"], index=1, help="Daha düşük seviye daha az çıktı ve daha hızlı UI")
-            csv_flush_interval = st.number_input("CSV flush interval (s)", min_value=0, value=0, help="0=Locust varsayılanı. Büyük dosyalarda 5-10 sn faydalı olabilir.")
-            stream_logs = st.checkbox("Canlı log akışı", value=True, help="Kapatırsanız performans artar, log dosyadan görülebilir.")
+            html_report = st.checkbox("HTML raporu üret", value=default_html_report, key="ui_html_report")
+            csv_full_history = st.checkbox("CSV full history", value=default_csv_full_history, key="ui_csv_full_history")
+            csv_prefix = st.text_input("CSV prefix", value=default_csv_prefix, key="ui_csv_prefix")
+            loglevel = st.selectbox("Log seviyesi", options=["ERROR", "WARNING", "INFO", "DEBUG"], index=1, help="Daha düşük seviye daha az çıktı ve daha hızlı UI", key="ui_loglevel")
+            csv_flush_interval = st.number_input("CSV flush interval (s)", min_value=0, value=0, help="0=Locust varsayılanı. Büyük dosyalarda 5-10 sn faydalı olabilir.", key="ui_csv_flush_interval")
+            stream_logs = st.checkbox("Canlı log akışı", value=True, help="Kapatırsanız performans artar, log dosyadan görülebilir.", key="ui_stream_logs")
+
+        prof = st.expander("Profil (kaydet / yükle)", expanded=False)
+        with prof:
+            pcol1, pcol2 = st.columns([2, 1])
+            with pcol1:
+                existing = list_profiles()
+                selected_profile = st.selectbox("Kayıtlı profiller", options=existing if existing else ["(profil yok)"] , index=0, key="ui_selected_profile")
+            with pcol2:
+                st.write(" ")
+                st.write(" ")
+                if existing:
+                    if st.button("Profili Yükle", use_container_width=True):
+                        pdata = load_profile(selected_profile)
+                        if pdata:
+                            # Push into session_state then rerun
+                            for k, v in pdata.items():
+                                st.session_state[f"ui_{k}"] = v
+                            # selected locustfile key name mismatch
+                            if "selected_file" in pdata:
+                                st.session_state["ui_selected_file"] = pdata["selected_file"]
+                            st.rerun()
+                delcol = st.checkbox("Silmeyi onayla", value=False, key="ui_delete_confirm")
+                if existing and st.button("Profili Sil", use_container_width=True, disabled=not st.session_state.get("ui_delete_confirm")):
+                    delete_profile(selected_profile)
+                    st.rerun()
+
+            st.divider()
+            name = st.text_input("Yeni profil adı", key="ui_profile_name")
+            if st.button("Profili Kaydet", type="primary"):
+                if not name.strip():
+                    st.warning("Lütfen bir profil adı girin.")
+                else:
+                    pdata = {
+                        "selected_file": st.session_state.get("ui_selected_file"),
+                        "use_file_host": st.session_state.get("ui_use_file_host"),
+                        "host": st.session_state.get("ui_host"),
+                        "users": int(st.session_state.get("ui_users", 1)),
+                        "spawn": int(st.session_state.get("ui_spawn", 1)),
+                        "run_time": st.session_state.get("ui_run_time"),
+                        "html_report": bool(st.session_state.get("ui_html_report", True)),
+                        "csv_full_history": bool(st.session_state.get("ui_csv_full_history", True)),
+                        "csv_prefix": st.session_state.get("ui_csv_prefix"),
+                        "loglevel": st.session_state.get("ui_loglevel"),
+                        "csv_flush_interval": int(st.session_state.get("ui_csv_flush_interval", 0)),
+                        "stream_logs": bool(st.session_state.get("ui_stream_logs", True)),
+                    }
+                    save_profile(name, pdata)
+                    st.success(f"Profil kaydedildi: {name}")
 
         run_btn = st.button(
             "Testi Başlat",
@@ -344,17 +467,17 @@ def main():
 
             proc, logfile, html_path, start, cmd = run_locust(
                 locustfile=locustfile_path,
-                host=None if use_file_host else host,
-                users=int(users),
-                spawn_rate=float(spawn),
-                run_time=run_time,
+                host=None if use_file_host else st.session_state.get("ui_host", host),
+                users=int(st.session_state.get("ui_users", users)),
+                spawn_rate=float(st.session_state.get("ui_spawn", spawn)),
+                run_time=st.session_state.get("ui_run_time", run_time),
                 run_dir=run_dir,
-                csv_prefix=csv_prefix,
-                html_report=html_report,
-                csv_full_history=csv_full_history,
-                loglevel=loglevel,
-                csv_flush_interval=(int(csv_flush_interval) if int(csv_flush_interval) > 0 else None),
-                stream_logs=stream_logs,
+                csv_prefix=st.session_state.get("ui_csv_prefix", csv_prefix),
+                html_report=bool(st.session_state.get("ui_html_report", html_report)),
+                csv_full_history=bool(st.session_state.get("ui_csv_full_history", csv_full_history)),
+                loglevel=st.session_state.get("ui_loglevel", loglevel),
+                csv_flush_interval=(int(st.session_state.get("ui_csv_flush_interval", csv_flush_interval)) or None),
+                stream_logs=bool(st.session_state.get("ui_stream_logs", stream_logs)),
             )
 
             log_lines = []
@@ -430,6 +553,27 @@ def main():
 
             if "stats" in data and not data["stats"].empty:
                 render_summary_from_stats(data["stats"])
+                # Threshold hints
+                th_p95 = _env_int("THRESHOLD_P95_MS")
+                th_success = _env_float("THRESHOLD_SUCCESS_RATE")
+                agg = aggregated_metrics(data["stats"])
+                if agg:
+                    msgs = []
+                    if th_p95 is not None and not pd.isna(agg.get("p95_ms")):
+                        if agg["p95_ms"] <= th_p95:
+                            msgs.append(f"p95 OK: {agg['p95_ms']:.0f} ms ≤ {th_p95} ms")
+                        else:
+                            msgs.append(f"p95 AŞILDI: {agg['p95_ms']:.0f} ms > {th_p95} ms")
+                    if th_success is not None and not pd.isna(agg.get("success_rate")):
+                        if agg["success_rate"] >= th_success:
+                            msgs.append(f"Başarı OK: {agg['success_rate']:.2f}% ≥ {th_success}%")
+                        else:
+                            msgs.append(f"Başarı DÜŞÜK: {agg['success_rate']:.2f}% < {th_success}%")
+                    if msgs:
+                        if any("AŞILDI" in m or "DÜŞÜK" in m for m in msgs):
+                            st.error(" | ".join(msgs))
+                        else:
+                            st.success(" | ".join(msgs))
                 st.divider()
                 st.caption("Ayrıntılı istek istatistikleri")
                 st.dataframe(data["stats"], use_container_width=True, height=300)
@@ -449,6 +593,35 @@ def main():
                     st.write(f"HTML raporu: {html_path}")
             else:
                 st.info("HTML raporu bulunamadı. 'HTML raporu üret' seçeneğini etkinleştirin.")
+
+            # Compare runs
+            st.divider()
+            st.subheader("Koşu Karşılaştırma")
+            others = [o for o in run_opts if o != sel]
+            if not others:
+                st.info("Karşılaştırmak için başka koşu yok.")
+            else:
+                other_sel = st.selectbox("Karşılaştırılacak çalışma", others)
+                other_run = BASE_DIR / other_sel
+                data2 = load_stats_cached(str(other_run), "stats", run_signature(other_run))
+                if "stats" not in data2 or data2["stats"].empty:
+                    st.warning("Diğer koşu için istatistik bulunamadı.")
+                else:
+                    a1 = aggregated_metrics(data["stats"]) if "stats" in data else {}
+                    a2 = aggregated_metrics(data2["stats"]) if "stats" in data2 else {}
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.caption(f"Seçili: {sel}")
+                        st.metric("İstek", f"{a1.get('requests','-')}")
+                        st.metric("Başarı %", f"{a1.get('success_rate', float('nan')):.2f}%" if a1 else "-")
+                        st.metric("p95 (ms)", f"{a1.get('p95_ms', float('nan')):.0f}" if a1 else "-")
+                        st.metric("Median (ms)", f"{a1.get('median_ms', float('nan')):.0f}" if a1 else "-")
+                    with c2:
+                        st.caption(f"Diğer: {other_sel}")
+                        st.metric("İstek", f"{a2.get('requests','-')}")
+                        st.metric("Başarı %", f"{a2.get('success_rate', float('nan')):.2f}%" if a2 else "-")
+                        st.metric("p95 (ms)", f"{a2.get('p95_ms', float('nan')):.0f}" if a2 else "-")
+                        st.metric("Median (ms)", f"{a2.get('median_ms', float('nan')):.0f}" if a2 else "-")
 
     with tabs[2]:
         st.subheader("Genel Dashboard")
@@ -595,6 +768,14 @@ def main():
                     ).reset_index()
                 )
                 g["success_rate_%"] = (1 - g["failures"] / g["requests"]) * 100
+
+                # Apply thresholds if provided
+                th_p95 = _env_int("THRESHOLD_P95_MS")
+                th_success = _env_float("THRESHOLD_SUCCESS_RATE")
+                if th_p95 is not None:
+                    g["p95_ok"] = g["avg_p95"].apply(lambda x: bool(x <= th_p95) if pd.notna(x) else None)
+                if th_success is not None:
+                    g["success_ok"] = g["success_rate_%"].apply(lambda x: bool(x >= th_success) if pd.notna(x) else None)
 
                 st.divider()
                 st.caption("Gruplanmış özet")
