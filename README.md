@@ -44,3 +44,18 @@ streamlit run app.py
 ## Koşu Karşılaştırma
 
 - Raporlar sekmesinde seçili koşuyu başka bir koşu ile kıyaslayabilirsiniz.
+
+## Dağıtık Mod (Master/Worker)
+
+- Test Çalıştır sekmesindeki "Dağıtık Mod" expander'ından etkinleştirin.
+- Worker sayısını girin (aynı makinede yerel olarak başlatılır).
+- Master process `--expect-workers` ile bekler; CSV/HTML raporları master üretir.
+
+## Zamanlayıcı
+
+- Test Çalıştır sekmesinde "Zamanlayıcı" expander'ı ile plan oluşturun.
+- Türler:
+  - Bir defalık: tarih-saat girin.
+  - Aralıklı: her N dakikada bir.
+- Planlar `schedules/` altında JSON dosyaları olarak saklanır.
+- Uygulama açıkken due olan planlar otomatik başlatılır (background, log akışı olmadan).

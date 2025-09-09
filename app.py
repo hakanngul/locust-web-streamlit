@@ -35,6 +35,8 @@ RUNS_DIR.mkdir(parents=True, exist_ok=True)
 LOCUSTFILES_DIR.mkdir(parents=True, exist_ok=True)
 PROFILES_DIR = BASE_DIR / "profiles"
 PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+SCHEDULES_DIR = BASE_DIR / "schedules"
+SCHEDULES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -62,6 +64,42 @@ def _env_float(key: str) -> Optional[float]:
         return float(raw)
     except Exception:
         return None
+
+
+# Simple parsers for matrix inputs
+def _parse_list_int(text: str) -> list[int]:
+    vals = []
+    for part in (text or "").replace("\n", ",").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            vals.append(int(p))
+        except Exception:
+            pass
+    return vals
+
+
+def _parse_list_float(text: str) -> list[float]:
+    vals = []
+    for part in (text or "").replace("\n", ",").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            vals.append(float(p))
+        except Exception:
+            pass
+    return vals
+
+
+def _parse_list_str(text: str) -> list[str]:
+    vals = []
+    for part in (text or "").replace("\n", ",").split(","):
+        p = part.strip()
+        if p:
+            vals.append(p)
+    return vals
 
 
 # Optionally suppress urllib3 OpenSSL warnings (macOS LibreSSL noise)
@@ -117,6 +155,111 @@ def delete_profile(name: str) -> bool:
     except Exception:
         return False
     return False
+
+
+# Schedules helpers
+def _schedule_path(sid: str) -> Path:
+    return SCHEDULES_DIR / f"{sid}.json"
+
+
+def list_schedules() -> list[Path]:
+    return sorted(SCHEDULES_DIR.glob("*.json"))
+
+
+def load_schedule(sid: str) -> Optional[dict]:
+    p = _schedule_path(sid)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_schedule(data: dict) -> Path:
+    sid = data.get("id") or datetime.utcnow().strftime("sch_%Y%m%d_%H%M%S")
+    data["id"] = sid
+    p = _schedule_path(sid)
+    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return p
+
+
+def delete_schedule(sid: str) -> bool:
+    p = _schedule_path(sid)
+    try:
+        if p.exists():
+            p.unlink()
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def trigger_due_schedules():
+    now = datetime.utcnow()
+    for sp in list_schedules():
+        try:
+            sch = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not sch.get("enabled", True):
+            continue
+        stype = sch.get("type", "one_time")
+        last_run = sch.get("last_run_at")
+        # Check one-time
+        if stype == "one_time":
+            at = sch.get("at")
+            if not at or sch.get("done"):
+                continue
+            try:
+                at_dt = datetime.fromisoformat(at)
+            except Exception:
+                continue
+            if now >= at_dt:
+                _start_scheduled_run(sch)
+        elif stype == "interval":
+            minutes = int(sch.get("every_minutes", 0) or 0)
+            if minutes <= 0:
+                continue
+            last_dt = None
+            if last_run:
+                try:
+                    last_dt = datetime.fromisoformat(last_run)
+                except Exception:
+                    last_dt = None
+            due = (last_dt is None) or ((now - last_dt).total_seconds() >= minutes * 60)
+            if due:
+                _start_scheduled_run(sch)
+
+
+def _start_scheduled_run(sch: dict):
+    # fire-and-forget scheduled run (no UI log streaming)
+    try:
+        locustfile_path = BASE_DIR / sch["locustfile"]
+        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S") + (f"_{sch['id']}" if sch.get("id") else "")
+        run_dir = RUNS_DIR / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        proc, logfile, html_path, start, cmd = run_locust(
+            locustfile=locustfile_path,
+            host=(None if sch.get("use_file_host") else sch.get("host")),
+            users=int(sch.get("users", 1)),
+            spawn_rate=float(sch.get("spawn_rate", 1)),
+            run_time=str(sch.get("run_time", "1m")),
+            run_dir=run_dir,
+            csv_prefix=str(sch.get("csv_prefix", "stats")),
+            html_report=bool(sch.get("html_report", True)),
+            csv_full_history=bool(sch.get("csv_full_history", True)),
+            loglevel=str(sch.get("loglevel", "WARNING")),
+            csv_flush_interval=None,
+            stream_logs=False,
+        )
+        # detach: do not wait
+        sch["last_run_at"] = start
+        sch["last_pid"] = proc.pid if proc and proc.pid else None
+        _schedule_path(sch["id"]).write_text(json.dumps(sch, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def ensure_sample_locustfile():
@@ -199,6 +342,91 @@ def run_locust(
         cwd=str(BASE_DIR),
     )
     return proc, logfile, html_path, start, cmd
+
+
+def run_locust_distributed(
+    locustfile: Path,
+    host: Optional[str],
+    users: int,
+    spawn_rate: float,
+    run_time: str,
+    run_dir: Path,
+    csv_prefix: str = "stats",
+    html_report: bool = True,
+    csv_full_history: bool = True,
+    loglevel: str = "WARNING",
+    csv_flush_interval: Optional[int] = None,
+    stream_logs: bool = True,
+    workers: int = 2,
+    master_bind_host: str = "127.0.0.1",
+    master_bind_port: int = 5557,
+):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    logfile_master = run_dir / "locust_master.log"
+    html_path = run_dir / "report.html"
+    csv_prefix_path = run_dir / csv_prefix
+
+    # Master command
+    master_cmd = [
+        "locust",
+        "-f", str(locustfile),
+        "--headless",
+        "--master",
+        "--expect-workers", str(workers),
+        "--master-bind-host", master_bind_host,
+        "--master-bind-port", str(master_bind_port),
+        "-u", str(users),
+        "-r", str(spawn_rate),
+        "--run-time", str(run_time),
+        "--csv", str(csv_prefix_path),
+        "--logfile", str(logfile_master),
+        "--only-summary",
+        "--loglevel", loglevel,
+    ]
+    if host:
+        master_cmd += ["--host", str(host)]
+    if html_report:
+        master_cmd += ["--html", str(html_path)]
+    if csv_full_history:
+        master_cmd += ["--csv-full-history"]
+    if csv_flush_interval:
+        master_cmd += ["--csv-flush-interval", str(int(csv_flush_interval))]
+
+    start = datetime.utcnow().isoformat()
+
+    master_proc = subprocess.Popen(
+        master_cmd,
+        stdout=(subprocess.PIPE if stream_logs else subprocess.DEVNULL),
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=str(BASE_DIR),
+    )
+
+    # Workers
+    worker_procs = []
+    for i in range(workers):
+        wlog = run_dir / f"locust_worker_{i+1}.log"
+        worker_cmd = [
+            "locust",
+            "-f", str(locustfile),
+            "--worker",
+            "--master-host", master_bind_host,
+            "--master-port", str(master_bind_port),
+            "--logfile", str(wlog),
+            "--loglevel", loglevel,
+        ]
+        p = subprocess.Popen(
+            worker_cmd,
+            stdout=(subprocess.PIPE if stream_logs else subprocess.DEVNULL),
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=str(BASE_DIR),
+        )
+        worker_procs.append((p, wlog, worker_cmd))
+
+    return master_proc, worker_procs, logfile_master, html_path, start, master_cmd
 
 
 def load_stats(run_dir: Path, prefix: str = "stats"):
@@ -342,6 +570,11 @@ def main():
 
     with tabs[0]:
         st.subheader("Locust Testini Çalıştır")
+        # Trigger scheduler on each view
+        try:
+            trigger_due_schedules()
+        except Exception:
+            pass
 
         if which_locust() is None:
             st.error("'locust' komutu bulunamadı. Lütfen 'pip install -r requirements.txt' ile bağımlılıkları kurun.")
@@ -445,12 +678,143 @@ def main():
                     save_profile(name, pdata)
                     st.success(f"Profil kaydedildi: {name}")
 
+        # Matrix runner UI
+        mx = st.expander("Parametre Taraması (Matrix)", expanded=False)
+        with mx:
+            st.caption("Virgülle ayırın. Örn: users=10,50 | spawn=2,5 | run-time=30s,1m")
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                mx_users_txt = st.text_input("Users listesi", value=f"{st.session_state.get('ui_users', default_users)}, {max(st.session_state.get('ui_users', default_users)*5, st.session_state.get('ui_users', default_users)+10)}")
+            with mc2:
+                base_spawn = int(st.session_state.get('ui_spawn', int(default_spawn)))
+                mx_spawn_txt = st.text_input("Spawn listesi", value=f"{base_spawn}, {max(base_spawn*2, base_spawn+1)}")
+            with mc3:
+                mx_runtime_txt = st.text_input("Run-time listesi", value=f"{st.session_state.get('ui_run_time', default_run_time)}, 2m")
+
+            mh1, mh2 = st.columns(2)
+            with mh1:
+                mx_use_file_host = st.checkbox("Host'u dosyadan al (matrix)", value=st.session_state.get('ui_use_file_host', use_file_host))
+            with mh2:
+                mx_hosts_txt = st.text_input("Host listesi (opsiyonel)", value=("" if mx_use_file_host else st.session_state.get('ui_host', host)))
+
+            mopts1, mopts2 = st.columns(2)
+            with mopts1:
+                mx_html = st.checkbox("HTML raporu (matrix)", value=st.session_state.get('ui_html_report', html_report))
+                mx_history = st.checkbox("CSV full history (matrix)", value=st.session_state.get('ui_csv_full_history', csv_full_history))
+            with mopts2:
+                mx_loglevel = st.selectbox("Log seviyesi (matrix)", options=["ERROR", "WARNING", "INFO"], index=1)
+                mx_stream = st.checkbox("Canlı log akışı (matrix)", value=False)
+
+            go_matrix = st.button("Matrix'i Çalıştır", type="primary")
+
+            if go_matrix:
+                # Build combinations
+                users_list = _parse_list_int(mx_users_txt)
+                spawn_list = _parse_list_int(mx_spawn_txt)
+                rt_list = _parse_list_str(mx_runtime_txt)
+                hosts_list = _parse_list_str(mx_hosts_txt) if not mx_use_file_host else [None]
+
+                if not users_list or not spawn_list or not rt_list:
+                    st.error("Users / Spawn / Run-time listeleri boş olamaz.")
+                else:
+                    import itertools
+                    combos = list(itertools.product(users_list, spawn_list, rt_list, hosts_list))
+                    MAX_COMBOS = 50
+                    if len(combos) > MAX_COMBOS:
+                        st.warning(f"Kombinasyon sayısı {len(combos)} > {MAX_COMBOS}. İlk {MAX_COMBOS} çalıştırılacak.")
+                        combos = combos[:MAX_COMBOS]
+
+                    progress = st.progress(0.0)
+                    status = st.empty()
+                    results = []
+                    batch_id = datetime.utcnow().strftime("batch_%Y%m%d_%H%M%S")
+                    for i, (uu, rr, rt, hh) in enumerate(combos, start=1):
+                        status.info(f"Çalışıyor: users={uu}, spawn={rr}, rt={rt}, host={'dosya' if mx_use_file_host else (hh or host)}")
+                        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S") + f"_{i:02d}"
+                        run_dir = RUNS_DIR / run_id
+                        run_dir.mkdir(parents=True, exist_ok=True)
+
+                        locustfile_path = BASE_DIR / selected_file
+                        effective_host_matrix = None if mx_use_file_host else (hh or host)
+
+                        proc, logfile, html_path, start, cmd = run_locust(
+                            locustfile=locustfile_path,
+                            host=effective_host_matrix,
+                            users=int(uu),
+                            spawn_rate=float(rr),
+                            run_time=rt,
+                            run_dir=run_dir,
+                            csv_prefix=st.session_state.get("ui_csv_prefix", csv_prefix),
+                            html_report=mx_html,
+                            csv_full_history=mx_history,
+                            loglevel=mx_loglevel,
+                            csv_flush_interval=None,
+                            stream_logs=mx_stream,
+                        )
+                        proc.wait()
+                        ended = datetime.utcnow().isoformat()
+
+                        # Save metadata
+                        meta = {
+                            "batch_id": batch_id,
+                            "matrix_idx": i,
+                            "locustfile": str(locustfile_path.relative_to(BASE_DIR)),
+                            "use_file_host": bool(mx_use_file_host),
+                            "typed_host": None if mx_use_file_host else (hh or host),
+                            "effective_host": None if mx_use_file_host else (hh or host),
+                            "users": int(uu),
+                            "spawn_rate": float(rr),
+                            "run_time": rt,
+                            "csv_prefix": st.session_state.get("ui_csv_prefix", csv_prefix),
+                            "html_report": bool(mx_html),
+                            "csv_full_history": bool(mx_history),
+                            "started_at": start,
+                            "ended_at": ended,
+                            "command": " ".join(cmd),
+                        }
+                        try:
+                            (run_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                        except Exception:
+                            pass
+
+                        # Load summary
+                        data_run = load_stats(run_dir, prefix=st.session_state.get("ui_csv_prefix", csv_prefix))
+                        agg = aggregated_metrics(data_run.get("stats")) if data_run.get("stats") is not None else {}
+                        results.append({
+                            "run_id": run_id,
+                            **meta,
+                            **({k: agg.get(k) for k in ["requests", "failures", "success_rate", "median_ms", "p95_ms"]} if agg else {}),
+                        })
+
+                        progress.progress(i / len(combos))
+
+                    status.success(f"Matrix tamamlandı. Toplam {len(results)} koşu.")
+                    dfres = pd.DataFrame(results)
+                    st.dataframe(dfres, use_container_width=True)
+
+                    # Save batch summary
+                    try:
+                        (RUNS_DIR / f"{batch_id}_summary.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+
+        dist = st.expander("Dağıtık Mod (Master/Worker)", expanded=False)
+        with dist:
+            dc1, dc2, dc3 = st.columns(3)
+            with dc1:
+                dist_enabled = st.checkbox("Dağıtık modu kullan", value=False, key="ui_dist_enabled")
+            with dc2:
+                dist_workers = st.number_input("Worker sayısı", min_value=1, value=2, key="ui_dist_workers")
+            with dc3:
+                dist_stream = st.checkbox("Canlı log (master)", value=True, key="ui_dist_stream")
+
         run_btn = st.button(
             "Testi Başlat",
             type="primary",
             use_container_width=True,
             disabled=(which_locust() is None or not selected_file or (not use_file_host and not host)),
         )
+        st.caption("Not: Zamanlayıcı etkinse, planlanan işleri bu sekme açıkken otomatik başlatır.")
 
         log_area = st.empty()
         status_area = st.empty()
@@ -465,39 +829,79 @@ def main():
 
             locustfile_path = BASE_DIR / selected_file
 
-            proc, logfile, html_path, start, cmd = run_locust(
-                locustfile=locustfile_path,
-                host=None if use_file_host else st.session_state.get("ui_host", host),
-                users=int(st.session_state.get("ui_users", users)),
-                spawn_rate=float(st.session_state.get("ui_spawn", spawn)),
-                run_time=st.session_state.get("ui_run_time", run_time),
-                run_dir=run_dir,
-                csv_prefix=st.session_state.get("ui_csv_prefix", csv_prefix),
-                html_report=bool(st.session_state.get("ui_html_report", html_report)),
-                csv_full_history=bool(st.session_state.get("ui_csv_full_history", csv_full_history)),
-                loglevel=st.session_state.get("ui_loglevel", loglevel),
-                csv_flush_interval=(int(st.session_state.get("ui_csv_flush_interval", csv_flush_interval)) or None),
-                stream_logs=bool(st.session_state.get("ui_stream_logs", stream_logs)),
-            )
+            if st.session_state.get("ui_dist_enabled", False):
+                # Distributed mode
+                mproc, wprocs, logfile, html_path, start, cmd = run_locust_distributed(
+                    locustfile=locustfile_path,
+                    host=None if use_file_host else st.session_state.get("ui_host", host),
+                    users=int(st.session_state.get("ui_users", users)),
+                    spawn_rate=float(st.session_state.get("ui_spawn", spawn)),
+                    run_time=st.session_state.get("ui_run_time", run_time),
+                    run_dir=run_dir,
+                    csv_prefix=st.session_state.get("ui_csv_prefix", csv_prefix),
+                    html_report=bool(st.session_state.get("ui_html_report", html_report)),
+                    csv_full_history=bool(st.session_state.get("ui_csv_full_history", csv_full_history)),
+                    loglevel=st.session_state.get("ui_loglevel", loglevel),
+                    csv_flush_interval=(int(st.session_state.get("ui_csv_flush_interval", csv_flush_interval)) or None),
+                    stream_logs=bool(st.session_state.get("ui_dist_stream", True)),
+                    workers=int(st.session_state.get("ui_dist_workers", 2)),
+                )
 
-            log_lines = []
-            with st.spinner("Locust çalışıyor... Lütfen bekleyin"):
-                if stream_logs and proc.stdout is not None:
-                    last_update = 0.0
-                    for line in proc.stdout:
-                        log_lines.append(line.rstrip())
-                        now = time.time()
-                        if now - last_update > 0.25:
-                            last_update = now
-                            to_show = "\n".join(log_lines[-200:])
-                            log_area.code(to_show)
-                proc.wait()
-                if not stream_logs:
+                log_lines = []
+                with st.spinner("Locust master/worker çalışıyor..."):
+                    if st.session_state.get("ui_dist_stream", True) and mproc.stdout is not None:
+                        last_update = 0.0
+                        for line in mproc.stdout:
+                            log_lines.append("MASTER: " + line.rstrip())
+                            now = time.time()
+                            if now - last_update > 0.25:
+                                last_update = now
+                                to_show = "\n".join(log_lines[-200:])
+                                log_area.code(to_show)
+                    mproc.wait()
+                # try to ensure workers exit too
+                for wp, wlog, _ in wprocs:
                     try:
-                        tail = (logfile.read_text(encoding="utf-8", errors="ignore").splitlines())[-200:]
-                        log_area.code("\n".join(tail))
+                        wp.wait(timeout=3)
                     except Exception:
-                        pass
+                        try:
+                            wp.terminate()
+                        except Exception:
+                            pass
+            else:
+                proc, logfile, html_path, start, cmd = run_locust(
+                    locustfile=locustfile_path,
+                    host=None if use_file_host else st.session_state.get("ui_host", host),
+                    users=int(st.session_state.get("ui_users", users)),
+                    spawn_rate=float(st.session_state.get("ui_spawn", spawn)),
+                    run_time=st.session_state.get("ui_run_time", run_time),
+                    run_dir=run_dir,
+                    csv_prefix=st.session_state.get("ui_csv_prefix", csv_prefix),
+                    html_report=bool(st.session_state.get("ui_html_report", html_report)),
+                    csv_full_history=bool(st.session_state.get("ui_csv_full_history", csv_full_history)),
+                    loglevel=st.session_state.get("ui_loglevel", loglevel),
+                    csv_flush_interval=(int(st.session_state.get("ui_csv_flush_interval", csv_flush_interval)) or None),
+                    stream_logs=bool(st.session_state.get("ui_stream_logs", stream_logs)),
+                )
+
+                log_lines = []
+                with st.spinner("Locust çalışıyor... Lütfen bekleyin"):
+                    if stream_logs and proc.stdout is not None:
+                        last_update = 0.0
+                        for line in proc.stdout:
+                            log_lines.append(line.rstrip())
+                            now = time.time()
+                            if now - last_update > 0.25:
+                                last_update = now
+                                to_show = "\n".join(log_lines[-200:])
+                                log_area.code(to_show)
+                    proc.wait()
+                    if not stream_logs:
+                        try:
+                            tail = (logfile.read_text(encoding="utf-8", errors="ignore").splitlines())[-200:]
+                            log_area.code("\n".join(tail))
+                        except Exception:
+                            pass
 
             st.session_state["running"] = False
             ended = datetime.utcnow().isoformat()
@@ -518,6 +922,8 @@ def main():
                 "started_at": start,
                 "ended_at": ended,
                 "command": " ".join(cmd),
+                "distributed": bool(st.session_state.get("ui_dist_enabled", False)),
+                "workers": int(st.session_state.get("ui_dist_workers", 0)) if st.session_state.get("ui_dist_enabled", False) else 0,
             }
             try:
                 (run_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -525,6 +931,109 @@ def main():
                 pass
 
             status_area.success(f"Tamamlandı. Çalışma klasörü: {run_dir}")
+
+        # Scheduler UI
+        sched = st.expander("Zamanlayıcı (planlanmış koşular)", expanded=False)
+        with sched:
+            sc1, sc2 = st.columns([2, 1])
+            with sc1:
+                st.caption("Bir defalık ya da belirli aralıklarla koşu planlayın. Kayıtlı profil ya da mevcut form değerleri kullanılır.")
+            with sc2:
+                use_profile_for_sched = st.checkbox("Profilden doldur", value=False, key="ui_sched_use_profile")
+            if use_profile_for_sched:
+                profs = list_profiles()
+                chosen = st.selectbox("Profil seçin", options=profs if profs else ["(profil yok)"])
+                pdata = load_profile(chosen) if profs else None
+            else:
+                pdata = None
+
+            st.markdown("— Oluştur —")
+            mode = st.radio("Tür", options=["Bir defalık", "Aralıklı"], horizontal=True)
+            if mode == "Bir defalık":
+                dcol, tcol = st.columns(2)
+                with dcol:
+                    dt_date = st.date_input("Tarih")
+                with tcol:
+                    dt_time = st.time_input("Saat")
+                sched_btn = st.button("Planı Kaydet")
+                if sched_btn:
+                    at_iso = datetime.combine(dt_date, dt_time).isoformat()
+                    data = {
+                        "id": datetime.utcnow().strftime("sch_%Y%m%d_%H%M%S"),
+                        "enabled": True,
+                        "type": "one_time",
+                        "at": at_iso,
+                        "created_at": datetime.utcnow().isoformat(),
+                        "locustfile": (pdata.get("selected_file") if pdata else st.session_state.get("ui_selected_file")),
+                        "use_file_host": (pdata.get("use_file_host") if pdata else st.session_state.get("ui_use_file_host")),
+                        "host": (pdata.get("host") if pdata else st.session_state.get("ui_host")),
+                        "users": int((pdata.get("users") if pdata else st.session_state.get("ui_users", 1))),
+                        "spawn_rate": float((pdata.get("spawn") if pdata else st.session_state.get("ui_spawn", 1))),
+                        "run_time": (pdata.get("run_time") if pdata else st.session_state.get("ui_run_time")),
+                        "csv_prefix": (pdata.get("csv_prefix") if pdata else st.session_state.get("ui_csv_prefix")),
+                        "html_report": bool((pdata.get("html_report") if pdata else st.session_state.get("ui_html_report", True))),
+                        "csv_full_history": bool((pdata.get("csv_full_history") if pdata else st.session_state.get("ui_csv_full_history", True))),
+                        "loglevel": (pdata.get("loglevel") if pdata else st.session_state.get("ui_loglevel")),
+                    }
+                    save_schedule(data)
+                    st.success("Zamanlanmış görev kaydedildi.")
+            else:
+                mins = st.number_input("Her kaç dakikada bir?", min_value=1, value=60)
+                sched_btn2 = st.button("Aralıklı Planı Kaydet")
+                if sched_btn2:
+                    data = {
+                        "id": datetime.utcnow().strftime("sch_%Y%m%d_%H%M%S"),
+                        "enabled": True,
+                        "type": "interval",
+                        "every_minutes": int(mins),
+                        "created_at": datetime.utcnow().isoformat(),
+                        "locustfile": (pdata.get("selected_file") if pdata else st.session_state.get("ui_selected_file")),
+                        "use_file_host": (pdata.get("use_file_host") if pdata else st.session_state.get("ui_use_file_host")),
+                        "host": (pdata.get("host") if pdata else st.session_state.get("ui_host")),
+                        "users": int((pdata.get("users") if pdata else st.session_state.get("ui_users", 1))),
+                        "spawn_rate": float((pdata.get("spawn") if pdata else st.session_state.get("ui_spawn", 1))),
+                        "run_time": (pdata.get("run_time") if pdata else st.session_state.get("ui_run_time")),
+                        "csv_prefix": (pdata.get("csv_prefix") if pdata else st.session_state.get("ui_csv_prefix")),
+                        "html_report": bool((pdata.get("html_report") if pdata else st.session_state.get("ui_html_report", True))),
+                        "csv_full_history": bool((pdata.get("csv_full_history") if pdata else st.session_state.get("ui_csv_full_history", True))),
+                        "loglevel": (pdata.get("loglevel") if pdata else st.session_state.get("ui_loglevel")),
+                    }
+                    save_schedule(data)
+                    st.success("Aralıklı görev kaydedildi.")
+
+            st.markdown("— Kayıtlı Planlar —")
+            sch_files = list_schedules()
+            if not sch_files:
+                st.info("Kayıtlı plan yok.")
+            else:
+                for sp in sch_files:
+                    try:
+                        sch = json.loads(sp.read_text(encoding="utf-8"))
+                    except Exception:
+                        continue
+                    c1, c2, c3, c4, c5 = st.columns([2,2,2,2,2])
+                    with c1:
+                        st.write(f"ID: {sch.get('id')}")
+                        st.write(f"Tür: {sch.get('type')}")
+                    with c2:
+                        if sch.get('type') == 'one_time':
+                            st.write(f"Zaman: {sch.get('at')}")
+                        else:
+                            st.write(f"Her {sch.get('every_minutes')} dk")
+                        st.write(f"Son Çalışma: {sch.get('last_run_at','-')}")
+                    with c3:
+                        st.write(f"Locustfile: {sch.get('locustfile')}")
+                        st.write(f"Host: {('dosya' if sch.get('use_file_host') else (sch.get('host') or '-'))}")
+                    with c4:
+                        en = st.checkbox("Etkin", value=bool(sch.get('enabled', True)), key=f"sch_en_{sch.get('id')}")
+                        if en != bool(sch.get('enabled', True)):
+                            sch['enabled'] = bool(en)
+                            sp.write_text(json.dumps(sch, indent=2), encoding='utf-8')
+                            st.experimental_rerun()
+                    with c5:
+                        if st.button("Sil", key=f"sch_del_{sch.get('id')}"):
+                            delete_schedule(sch.get('id'))
+                            st.experimental_rerun()
 
     with tabs[1]:
         st.subheader("Raporları Gör")

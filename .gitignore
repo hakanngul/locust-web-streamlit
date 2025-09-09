@@ -11,6 +11,7 @@ runs/
 *.log
 .env
 profiles/
+schedules/
 
 # Envs
 .venv/
