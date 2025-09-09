@@ -235,7 +235,7 @@ def main():
 
     ensure_sample_locustfile()
 
-    tabs = st.tabs(["Test Çalıştır", "Raporları Gör", "Geçmiş Çalışmalar", "Kurulum"])
+    tabs = st.tabs(["Test Çalıştır", "Raporları Gör", "Genel Dashboard", "Geçmiş Çalışmalar", "Kurulum"])
 
     with tabs[0]:
         st.subheader("Locust Testini Çalıştır")
@@ -408,6 +408,179 @@ def main():
                 st.info("HTML raporu bulunamadı. 'HTML raporu üret' seçeneğini etkinleştirin.")
 
     with tabs[2]:
+        st.subheader("Genel Dashboard")
+
+        def _first_col(df: pd.DataFrame, candidates: list[str]):
+            for c in candidates:
+                if c in df.columns:
+                    return c
+            return None
+
+        def _try_number(val, default=None):
+            try:
+                if pd.isna(val):
+                    return default
+                return float(val)
+            except Exception:
+                return default
+
+        # Collect run summaries
+        summaries = []
+        for r in list_runs():
+            meta = {}
+            mp = r / "metadata.json"
+            if mp.exists():
+                try:
+                    meta = json.loads(mp.read_text(encoding="utf-8"))
+                except Exception:
+                    meta = {}
+            data = load_stats(r)
+            agg = None
+            if "stats" in data and not data["stats"].empty:
+                sdf = data["stats"]
+                name_col = _first_col(sdf, ["Name", "name"]) or "Name"
+                agg_rows = sdf[sdf[name_col].astype(str).str.lower() == "aggregated"] if name_col in sdf.columns else pd.DataFrame()
+                if not agg_rows.empty:
+                    agg = agg_rows.iloc[0]
+
+            if agg is None:
+                continue
+
+            # Extract values with multiple possible column names
+            req_count = _try_number(agg.get("Request Count", agg.get("Requests", 0)), 0)
+            fail_count = _try_number(agg.get("Failure Count", agg.get("Failures", 0)), 0)
+            median = _try_number(agg.get("50%ile", agg.get("Median Response Time", agg.get("50%", None))))
+            p95 = _try_number(agg.get("95%ile", agg.get("95%", None)))
+
+            # Average RPS from history if available
+            avg_rps = None
+            if "history" in data and not data["history"].empty:
+                hdf = data["history"]
+                rps_col = _first_col(hdf, ["Requests/s", "RPS", "requests/s"]) 
+                if rps_col:
+                    try:
+                        avg_rps = float(hdf[rps_col].astype(float).mean())
+                    except Exception:
+                        avg_rps = None
+
+            summaries.append(
+                {
+                    "run_id": r.name,
+                    "path": str(r),
+                    "locustfile": meta.get("locustfile"),
+                    "host": meta.get("effective_host") or meta.get("typed_host") or meta.get("file_host"),
+                    "started_at": meta.get("started_at"),
+                    "ended_at": meta.get("ended_at"),
+                    "users": meta.get("users"),
+                    "spawn_rate": meta.get("spawn_rate"),
+                    "run_time": meta.get("run_time"),
+                    "requests": req_count,
+                    "failures": fail_count,
+                    "success_rate": (1 - fail_count / req_count) * 100 if req_count and req_count > 0 else None,
+                    "median_ms": median,
+                    "p95_ms": p95,
+                    "avg_rps": avg_rps,
+                }
+            )
+
+        if not summaries:
+            st.info("Henüz metadata'lı bir çalışma bulunamadı. Yeni bir test çalıştırın.")
+        else:
+            df = pd.DataFrame(summaries)
+
+            # Filters
+            c1, c2, c3 = st.columns([2, 2, 2])
+            with c1:
+                locust_opts = sorted([x for x in df["locustfile"].dropna().unique().tolist()])
+                sel_locust = st.multiselect("Locustfile filtresi", options=locust_opts, default=locust_opts)
+            with c2:
+                host_opts = sorted([x for x in df["host"].dropna().unique().tolist()])
+                sel_host = st.multiselect("Host filtresi", options=host_opts, default=host_opts)
+            with c3:
+                group_by = st.selectbox("Gruplama", options=["Host", "Locustfile", "Host+Locustfile"], index=0)
+
+            fdf = df.copy()
+            if sel_locust:
+                fdf = fdf[fdf["locustfile"].isin(sel_locust)]
+            if sel_host:
+                fdf = fdf[fdf["host"].isin(sel_host)]
+
+            if fdf.empty:
+                st.warning("Seçilen filtrelerle eşleşen çalışma yok.")
+            else:
+                # Summary KPIs (weighted where applicable)
+                total_runs = len(fdf)
+                total_req = float(fdf["requests"].fillna(0).sum())
+                total_fail = float(fdf["failures"].fillna(0).sum())
+                overall_success = (1 - total_fail / total_req) * 100 if total_req > 0 else None
+
+                # Weighted p95 by requests as an approximation
+                def weighted_avg(series, weights):
+                    try:
+                        s = series.astype(float)
+                        w = weights.astype(float)
+                        if w.sum() == 0:
+                            return None
+                        return float((s * w).sum() / w.sum())
+                    except Exception:
+                        return None
+
+                weighted_p95 = weighted_avg(fdf["p95_ms"].fillna(0), fdf["requests"].fillna(0))
+
+                k = st.columns(4)
+                k[0].metric("Koşu Sayısı", str(total_runs))
+                k[1].metric("Toplam İstek", f"{int(total_req)}")
+                k[2].metric("Başarı Oranı", f"{overall_success:.1f}%" if overall_success is not None else "-")
+                k[3].metric("Ağırlıklı p95 (ms)", f"{weighted_p95:.0f}" if weighted_p95 is not None else "-")
+
+                # Grouping
+                if group_by == "Host":
+                    gkey = ["host"]
+                elif group_by == "Locustfile":
+                    gkey = ["locustfile"]
+                else:
+                    gkey = ["host", "locustfile"]
+
+                g = (
+                    fdf.groupby(gkey).agg(
+                        requests=("requests", "sum"),
+                        failures=("failures", "sum"),
+                        avg_p95=("p95_ms", "mean"),
+                        avg_median=("median_ms", "mean"),
+                        avg_rps=("avg_rps", "mean"),
+                        runs=("run_id", "count"),
+                    ).reset_index()
+                )
+                g["success_rate_%"] = (1 - g["failures"] / g["requests"]) * 100
+
+                st.divider()
+                st.caption("Gruplanmış özet")
+                st.dataframe(g, use_container_width=True)
+
+                st.divider()
+                c1, c2 = st.columns(2)
+                with c1:
+                    try:
+                        fig = px.bar(g.sort_values("avg_p95", ascending=False),
+                                     x=("host" if "host" in g.columns else "locustfile"),
+                                     y="avg_p95",
+                                     color="success_rate_%",
+                                     title="p95 (ms) ve Başarı Oranı")
+                        st.plotly_chart(fig, use_container_width=True)
+                    except Exception:
+                        pass
+                with c2:
+                    try:
+                        fig2 = px.bar(g.sort_values("requests", ascending=False),
+                                      x=("host" if "host" in g.columns else "locustfile"),
+                                      y="requests",
+                                      color="failures",
+                                      title="İstek Hacmi ve Hatalar")
+                        st.plotly_chart(fig2, use_container_width=True)
+                    except Exception:
+                        pass
+
+    with tabs[3]:
         st.subheader("Geçmiş Çalışmalar")
         runs = list_runs()
         if not runs:
@@ -418,7 +591,7 @@ def main():
                 html_exists = (r / "report.html").exists()
                 st.write(f"- {r.name}  | CSV: {'✅' if any_stats else '❌'} | HTML: {'✅' if html_exists else '❌'}  | Klasör: {r}")
 
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("Kurulum ve Kullanım")
         st.markdown(
             """
