@@ -1,0 +1,16 @@
+{
+  "locustfile": "locustfiles/reqres_locustfile.py",
+  "use_file_host": true,
+  "file_host": "https://reqres.in",
+  "typed_host": null,
+  "effective_host": "https://reqres.in",
+  "users": 10,
+  "spawn_rate": 2.0,
+  "run_time": "1m",
+  "csv_prefix": "stats",
+  "html_report": true,
+  "csv_full_history": true,
+  "started_at": "2025-09-09T07:37:29.803801",
+  "ended_at": "2025-09-09T07:38:30.179182",
+  "command": "locust -f /Users/hakangul/Projects/locust-web-streamlit/locustfiles/reqres_locustfile.py --headless -u 10 -r 2.0 --run-time 1m --csv /Users/hakangul/Projects/locust-web-streamlit/runs/20250909_073729/stats --logfile /Users/hakangul/Projects/locust-web-streamlit/runs/20250909_073729/locust.log --only-summary --html /Users/hakangul/Projects/locust-web-streamlit/runs/20250909_073729/report.html --csv-full-history"
+}

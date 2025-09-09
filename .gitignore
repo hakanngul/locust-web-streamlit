@@ -7,7 +7,6 @@ __pycache__/
 .streamlit/
 
 # Runs and outputs
-runs/
 *.log
 .env
 

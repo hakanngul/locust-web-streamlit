@@ -1,0 +1,16 @@
+{
+  "locustfile": "locustfiles/jsonplaceholder_locustfile.py",
+  "use_file_host": true,
+  "file_host": "https://jsonplaceholder.typicode.com",
+  "typed_host": null,
+  "effective_host": "https://jsonplaceholder.typicode.com",
+  "users": 10,
+  "spawn_rate": 2.0,
+  "run_time": "1m",
+  "csv_prefix": "stats",
+  "html_report": true,
+  "csv_full_history": true,
+  "started_at": "2025-09-09T08:15:54.468377",
+  "ended_at": "2025-09-09T08:16:54.887579",
+  "command": "locust -f /Users/hakangul/Projects/locust-web-streamlit/locustfiles/jsonplaceholder_locustfile.py --headless -u 10 -r 2.0 --run-time 1m --csv /Users/hakangul/Projects/locust-web-streamlit/runs/20250909_081554/stats --logfile /Users/hakangul/Projects/locust-web-streamlit/runs/20250909_081554/locust.log --only-summary --loglevel WARNING --html /Users/hakangul/Projects/locust-web-streamlit/runs/20250909_081554/report.html --csv-full-history"
+}

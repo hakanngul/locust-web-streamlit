@@ -1,0 +1,4 @@
+Method,Name,Error,Occurrences
+GET,/api/users?page=2,"ConnectionRefusedError(61, 'Connection refused')",286
+GET,/api/users/2,"ConnectionRefusedError(61, 'Connection refused')",190
+POST,/api/users,"ConnectionRefusedError(61, 'Connection refused')",100

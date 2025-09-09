@@ -1,0 +1,5 @@
+Method,Name,Error,Occurrences
+GET,/comments?postId=1,"ConnectionRefusedError(61, 'Connection refused')",143
+POST,/posts,"ConnectionRefusedError(61, 'Connection refused')",68
+GET,/posts/1,"ConnectionRefusedError(61, 'Connection refused')",123
+GET,/posts,"ConnectionRefusedError(61, 'Connection refused')",231
