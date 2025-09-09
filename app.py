@@ -414,7 +414,7 @@ def main():
             selected_run = BASE_DIR / sel
             data = load_stats_cached(str(selected_run), "stats", run_signature(selected_run))
 
-            # Show metadata if exists
+            # Üst bilgi (metadata)
             meta_path = selected_run / "metadata.json"
             if meta_path.exists():
                 try:
@@ -428,27 +428,31 @@ def main():
                 except Exception:
                     pass
 
-            if "stats" in data and not data["stats"].empty:
-                render_summary_from_stats(data["stats"])
-                st.divider()
-                st.caption("Ayrıntılı istek istatistikleri")
-                st.dataframe(data["stats"], use_container_width=True, height=300)
+            # Alt sekmeler: Özet/CSV ve Locust Test Report
+            sub_tabs = st.tabs(["Özet", "Locust Test Report"])
 
-            if "history" in data and not data["history"].empty:
-                st.divider()
-                render_time_series(data["history"])
+            with sub_tabs[0]:
+                if "stats" in data and not data["stats"].empty:
+                    render_summary_from_stats(data["stats"])
+                    st.divider()
+                    st.caption("Ayrıntılı istek istatistikleri")
+                    st.dataframe(data["stats"], use_container_width=True, height=300)
 
-            html_path = selected_run / "report.html"
-            if html_path.exists():
-                st.divider()
-                st.caption("HTML Rapor (gömülü)")
-                try:
-                    html = html_path.read_text(encoding="utf-8")
-                    components.html(html, height=700, scrolling=True)
-                except Exception:
-                    st.write(f"HTML raporu: {html_path}")
-            else:
-                st.info("HTML raporu bulunamadı. 'HTML raporu üret' seçeneğini etkinleştirin.")
+                if "history" in data and not data["history"].empty:
+                    st.divider()
+                    render_time_series(data["history"])
+
+            with sub_tabs[1]:
+                html_path = selected_run / "report.html"
+                if html_path.exists():
+                    st.caption("Locust HTML Raporu")
+                    try:
+                        html = html_path.read_text(encoding="utf-8")
+                        components.html(html, height=700, scrolling=True)
+                    except Exception:
+                        st.write(f"HTML raporu: {html_path}")
+                else:
+                    st.info("HTML raporu bulunamadı. 'HTML raporu üret' seçeneğini etkinleştirin.")
 
     with tabs[2]:
         st.subheader("Genel Dashboard")
