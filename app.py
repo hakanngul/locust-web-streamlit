@@ -4,12 +4,16 @@ import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
+import json
+import re
 
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
+import warnings
+
 
 
 BASE_DIR = Path(__file__).parent.resolve()
@@ -27,6 +31,23 @@ RUNS_DIR = _resolve_dir("RUNS_DIR", "runs")
 LOCUSTFILES_DIR = _resolve_dir("LOCUSTFILES_DIR", "locustfiles")
 RUNS_DIR.mkdir(parents=True, exist_ok=True)
 LOCUSTFILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Optionally suppress urllib3 OpenSSL warnings (macOS LibreSSL noise)
+if _env_bool("SUPPRESS_SSL_WARNINGS", False):
+    try:
+        from urllib3.exceptions import NotOpenSSLWarning
+
+        warnings.filterwarnings("ignore", category=NotOpenSSLWarning)
+    except Exception:
+        pass
 
 
 from typing import Optional
@@ -112,7 +133,7 @@ def run_locust(
         bufsize=1,
         cwd=str(BASE_DIR),
     )
-    return proc, logfile, html_path, start
+    return proc, logfile, html_path, start, cmd
 
 
 def load_stats(run_dir: Path, prefix: str = "stats"):
@@ -197,6 +218,17 @@ def locustfile_declares_host(path: Path) -> bool:
     return any(line.strip().startswith("host =") for line in text.splitlines())
 
 
+def extract_locustfile_host(path: Path) -> Optional[str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    m = re.search(r"^\s*host\s*=\s*['\"]([^'\"]+)['\"]", text, flags=re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 def main():
     st.set_page_config(page_title="Locust Web - Streamlit", layout="wide")
     st.title("Locust Yük Testleri - Streamlit Arayüz")
@@ -234,12 +266,17 @@ def main():
         has_file_host = bool(selected_path and locustfile_declares_host(selected_path))
         use_file_host = st.checkbox("Host'u locustfile içinden kullan", value=has_file_host)
 
+        file_host_val = extract_locustfile_host(selected_path) if selected_path else None
+
         host = st.text_input(
             "Host (örn: https://example.com)",
             value=default_host,
             disabled=use_file_host,
             help="Boş bırakılırsa ve üstteki seçenek açıksa locustfile'daki host kullanılır."
         )
+
+        effective_host = (file_host_val if use_file_host else host) or ""
+        st.caption(f"Etkin host: {effective_host if effective_host else '—'}" + (f" (dosyadan)" if use_file_host and file_host_val else ""))
         col1, col2, col3 = st.columns(3)
         with col1:
             users = st.number_input("Kullanıcı sayısı (-u)", min_value=1, value=default_users)
@@ -274,7 +311,7 @@ def main():
 
             locustfile_path = BASE_DIR / selected_file
 
-            proc, logfile, html_path, start = run_locust(
+            proc, logfile, html_path, start, cmd = run_locust(
                 locustfile=locustfile_path,
                 host=None if use_file_host else host,
                 users=int(users),
@@ -297,6 +334,30 @@ def main():
                 proc.wait()
 
             st.session_state["running"] = False
+            ended = datetime.utcnow().isoformat()
+
+            # Save run metadata
+            meta = {
+                "locustfile": str(locustfile_path.relative_to(BASE_DIR)),
+                "use_file_host": bool(use_file_host),
+                "file_host": file_host_val,
+                "typed_host": host if not use_file_host else None,
+                "effective_host": effective_host,
+                "users": int(users),
+                "spawn_rate": float(spawn),
+                "run_time": run_time,
+                "csv_prefix": csv_prefix,
+                "html_report": bool(html_report),
+                "csv_full_history": bool(csv_full_history),
+                "started_at": start,
+                "ended_at": ended,
+                "command": " ".join(cmd),
+            }
+            try:
+                (run_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
             status_area.success(f"Tamamlandı. Çalışma klasörü: {run_dir}")
 
     with tabs[1]:
@@ -309,6 +370,20 @@ def main():
             sel = st.selectbox("Çalışma seçin", run_opts)
             selected_run = BASE_DIR / sel
             data = load_stats(selected_run)
+
+            # Show metadata if exists
+            meta_path = selected_run / "metadata.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    cols = st.columns(4)
+                    cols[0].metric("Etkin Host", meta.get("effective_host", "-"))
+                    cols[1].metric("Kullanıcı", str(meta.get("users", "-")))
+                    cols[2].metric("Spawn/s", str(meta.get("spawn_rate", "-")))
+                    cols[3].metric("Süre", meta.get("run_time", "-"))
+                    st.caption(f"Locustfile: {meta.get('locustfile')} | Başlangıç: {meta.get('started_at')} | Bitiş: {meta.get('ended_at')}")
+                except Exception:
+                    pass
 
             if "stats" in data and not data["stats"].empty:
                 render_summary_from_stats(data["stats"])
