@@ -536,6 +536,59 @@ def aggregated_metrics(stats_df: pd.DataFrame) -> dict:
     return {"requests": req, "failures": fail, "median_ms": median, "p95_ms": p95, "success_rate": success_rate}
 
 
+def normalize_endpoint_stats(stats_df: pd.DataFrame) -> pd.DataFrame:
+    """Return a DataFrame with standardized columns per endpoint, excluding the Aggregated row."""
+    if stats_df is None or stats_df.empty:
+        return pd.DataFrame(columns=["name", "requests", "failures", "median_ms", "p95_ms"])
+    df = stats_df.copy()
+    # Find name column
+    name_col = "Name" if "Name" in df.columns else ("name" if "name" in df.columns else None)
+    if not name_col:
+        return pd.DataFrame(columns=["name", "requests", "failures", "median_ms", "p95_ms"])
+    # Exclude Aggregated
+    try:
+        df = df[df[name_col].astype(str).str.lower() != "aggregated"]
+    except Exception:
+        pass
+    # Map columns
+    req_col = "Request Count" if "Request Count" in df.columns else ("Requests" if "Requests" in df.columns else None)
+    fail_col = "Failure Count" if "Failure Count" in df.columns else ("Failures" if "Failures" in df.columns else None)
+    median_col = None
+    for c in ["50%ile", "Median Response Time", "50%", "Median"]:
+        if c in df.columns:
+            median_col = c
+            break
+    p95_col = None
+    for c in ["95%ile", "95%", "Percentile 95%", "p95"]:
+        if c in df.columns:
+            p95_col = c
+            break
+    out = pd.DataFrame()
+    out["name"] = df[name_col]
+    if req_col:
+        out["requests"] = pd.to_numeric(df[req_col], errors="coerce")
+    else:
+        out["requests"] = pd.NA
+    if fail_col:
+        out["failures"] = pd.to_numeric(df[fail_col], errors="coerce")
+    else:
+        out["failures"] = pd.NA
+    if median_col:
+        out["median_ms"] = pd.to_numeric(df[median_col], errors="coerce")
+    else:
+        out["median_ms"] = pd.NA
+    if p95_col:
+        out["p95_ms"] = pd.to_numeric(df[p95_col], errors="coerce")
+    else:
+        out["p95_ms"] = pd.NA
+    # Success rate per endpoint
+    try:
+        out["success_rate"] = (1 - (out["failures"].astype(float) / out["requests"].astype(float))) * 100
+    except Exception:
+        out["success_rate"] = pd.NA
+    return out
+
+
 def list_runs() -> list[Path]:
     return sorted([p for p in RUNS_DIR.iterdir() if p.is_dir()], reverse=True)
 
@@ -1132,6 +1185,76 @@ def main():
                         st.metric("p95 (ms)", f"{a2.get('p95_ms', float('nan')):.0f}" if a2 else "-")
                         st.metric("Median (ms)", f"{a2.get('median_ms', float('nan')):.0f}" if a2 else "-")
 
+                    st.divider()
+                    st.caption("Endpoint Bazlı Karşılaştırma")
+                    try:
+                        end_a = normalize_endpoint_stats(data.get("stats"))
+                        end_b = normalize_endpoint_stats(data2.get("stats"))
+                        if end_a.empty and end_b.empty:
+                            st.info("Endpoint istatistikleri bulunamadı.")
+                        else:
+                            # Align by endpoint name
+                            end_a = end_a.set_index("name")
+                            end_b = end_b.set_index("name")
+                            all_names = sorted(set(end_a.index.tolist()) | set(end_b.index.tolist()))
+                            comp = pd.DataFrame(index=all_names)
+                            # Suffix with A/B
+                            for col in ["requests", "failures", "success_rate", "median_ms", "p95_ms"]:
+                                comp[f"{col}_A"] = end_a[col] if col in end_a.columns else pd.NA
+                                comp[f"{col}_B"] = end_b[col] if col in end_b.columns else pd.NA
+                            # Deltas (B - A)
+                            comp["p95_delta_ms"] = comp["p95_ms_B"].astype(float) - comp["p95_ms_A"].astype(float)
+                            comp["median_delta_ms"] = comp["median_ms_B"].astype(float) - comp["median_ms_A"].astype(float)
+                            comp["success_delta_%"] = comp["success_rate_B"].astype(float) - comp["success_rate_A"].astype(float)
+                            comp = comp.reset_index().rename(columns={"index": "endpoint"})
+
+                            # Sort by worst p95 regression first
+                            comp_sorted = comp.sort_values("p95_delta_ms", ascending=False)
+                            st.dataframe(comp_sorted, use_container_width=True, height=360)
+                    except Exception:
+                        st.warning("Endpoint karşılaştırması oluşturulurken bir sorun oluştu.")
+
+            # Failure/Exception Analysis for selected run
+            st.divider()
+            st.subheader("Hata Analizi ve Sorunlu Endpointler")
+            try:
+                failures_df = data.get("failures") if "failures" in data else None
+                stats_df = data.get("stats") if "stats" in data else None
+                exceptions_df = data.get("exceptions") if "exceptions" in data else None
+
+                cols = st.columns(2)
+                with cols[0]:
+                    if failures_df is not None and not failures_df.empty:
+                        fdf = failures_df.copy()
+                        # Normalize
+                        name_col = "Name" if "Name" in fdf.columns else ("name" if "name" in fdf.columns else None)
+                        err_col = "Error" if "Error" in fdf.columns else ("error" if "error" in fdf.columns else None)
+                        occ_col = "Occurrences" if "Occurrences" in fdf.columns else ("occurrences" if "occurrences" in fdf.columns else None)
+                        if name_col and err_col and occ_col:
+                            by_name = fdf.groupby(name_col)[occ_col].sum().sort_values(ascending=False).head(10)
+                            fig_bar = px.bar(by_name, title="En Çok Hata Alan Endpointler (Occurrences)")
+                            st.plotly_chart(fig_bar, use_container_width=True)
+                        else:
+                            st.info("Failures CSV beklenen kolonları içermiyor.")
+                    else:
+                        st.info("Hata (failures.csv) verisi yok.")
+                with cols[1]:
+                    if exceptions_df is not None and not exceptions_df.empty:
+                        edf = exceptions_df.copy()
+                        # Expect columns Count, Message
+                        cnt_col = "Count" if "Count" in edf.columns else ("count" if "count" in edf.columns else None)
+                        msg_col = "Message" if "Message" in edf.columns else ("message" if "message" in edf.columns else None)
+                        if cnt_col and msg_col:
+                            edf2 = edf.sort_values(cnt_col, ascending=False).head(10)[[cnt_col, msg_col]]
+                            st.dataframe(edf2.rename(columns={cnt_col: "Count", msg_col: "Message"}), use_container_width=True)
+                        else:
+                            st.info("Exceptions CSV beklenen kolonları içermiyor.")
+                    else:
+                        st.info("Exception verisi yok.")
+
+            except Exception:
+                st.warning("Hata analizi oluşturulurken bir sorun oluştu.")
+
     with tabs[2]:
         st.subheader("Genel Dashboard")
 
@@ -1212,6 +1335,14 @@ def main():
             st.info("Henüz metadata'lı bir çalışma bulunamadı. Yeni bir test çalıştırın.")
         else:
             df = pd.DataFrame(summaries)
+            # Parse datetime for filtering/trends
+            if "started_at" in df.columns:
+                try:
+                    df["started_at_dt"] = pd.to_datetime(df["started_at"], errors="coerce")
+                    df["started_date"] = df["started_at_dt"].dt.date
+                except Exception:
+                    df["started_at_dt"] = pd.NaT
+                    df["started_date"] = pd.NaT
 
             # Filters
             c1, c2, c3 = st.columns([2, 2, 2])
@@ -1224,11 +1355,26 @@ def main():
             with c3:
                 group_by = st.selectbox("Gruplama", options=["Host", "Locustfile", "Host+Locustfile"], index=0)
 
+            # Date range filter
+            if df["started_at_dt"].notna().any():
+                min_d = pd.to_datetime(df["started_at_dt"].min()).date()
+                max_d = pd.to_datetime(df["started_at_dt"].max()).date()
+                dr = st.date_input("Tarih aralığı", value=(min_d, max_d))
+            else:
+                dr = None
+
             fdf = df.copy()
             if sel_locust:
                 fdf = fdf[fdf["locustfile"].isin(sel_locust)]
             if sel_host:
                 fdf = fdf[fdf["host"].isin(sel_host)]
+            if dr and isinstance(dr, tuple) and len(dr) == 2:
+                start_d, end_d = dr
+                try:
+                    mask = (fdf["started_date"] >= start_d) & (fdf["started_date"] <= end_d)
+                    fdf = fdf[mask]
+                except Exception:
+                    pass
 
             if fdf.empty:
                 st.warning("Seçilen filtrelerle eşleşen çalışma yok.")
@@ -1257,6 +1403,39 @@ def main():
                 k[1].metric("Toplam İstek", f"{int(total_req)}")
                 k[2].metric("Başarı Oranı", f"{overall_success:.1f}%" if overall_success is not None else "-")
                 k[3].metric("Ağırlıklı p95 (ms)", f"{weighted_p95:.0f}" if weighted_p95 is not None else "-")
+
+                # Trend charts
+                st.divider()
+                st.caption("Trend Grafikleri")
+                if fdf["started_at_dt"].notna().any():
+                    t1, t2 = st.columns(2)
+                    with t1:
+                        try:
+                            figt1 = px.line(
+                                fdf.sort_values("started_at_dt"),
+                                x="started_at_dt",
+                                y="p95_ms",
+                                color=("host" if group_by in ["Host", "Host+Locustfile"] else "locustfile"),
+                                markers=True,
+                                title="p95 (ms) Trendi",
+                            )
+                            st.plotly_chart(figt1, use_container_width=True)
+                        except Exception:
+                            pass
+                    with t2:
+                        try:
+                            figt2 = px.line(
+                                fdf.sort_values("started_at_dt"),
+                                x="started_at_dt",
+                                y="success_rate",
+                                color=("host" if group_by in ["Host", "Host+Locustfile"] else "locustfile"),
+                                markers=True,
+                                title="Başarı Oranı (%) Trendi",
+                            )
+                            figt2.update_yaxes(range=[0,100])
+                            st.plotly_chart(figt2, use_container_width=True)
+                        except Exception:
+                            pass
 
                 # Grouping
                 if group_by == "Host":
@@ -1312,6 +1491,47 @@ def main():
                         st.plotly_chart(fig2, use_container_width=True)
                     except Exception:
                         pass
+
+                # Optional: Top problematic endpoints across filtered runs (approx by total failures)
+                try:
+                    st.divider()
+                    st.caption("Top Sorunlu Endpointler (filtreye göre)")
+                    rows = []
+                    for r in list_runs():
+                        meta = {}
+                        mp = r / "metadata.json"
+                        if mp.exists():
+                            try:
+                                meta = json.loads(mp.read_text(encoding="utf-8"))
+                            except Exception:
+                                meta = {}
+                        host_m = meta.get("effective_host") or meta.get("typed_host") or meta.get("file_host")
+                        locust_m = meta.get("locustfile")
+                        if sel_locust and locust_m not in sel_locust:
+                            continue
+                        if sel_host and host_m not in sel_host:
+                            continue
+                        data_r = load_stats_cached(str(r), "stats", run_signature(r))
+                        if "stats" in data_r and not data_r["stats"].empty:
+                            end_df = normalize_endpoint_stats(data_r["stats"])  # includes failures/requests
+                            if not end_df.empty:
+                                end_df = end_df.copy()
+                                end_df["host"] = host_m
+                                end_df["locustfile"] = locust_m
+                                rows.append(end_df)
+                    if rows:
+                        edfall = pd.concat(rows, ignore_index=True)
+                        grp = edfall.groupby(["name"]).agg(
+                            requests=("requests", "sum"),
+                            failures=("failures", "sum"),
+                        ).reset_index()
+                        grp["fail_rate_%"] = (grp["failures"] / grp["requests"]) * 100
+                        grp = grp.sort_values(["fail_rate_%", "failures"], ascending=False).head(15)
+                        st.dataframe(grp, use_container_width=True)
+                    else:
+                        st.info("Seçili filtrelere göre endpoint verisi bulunamadı.")
+                except Exception:
+                    pass
 
     with tabs[3]:
         st.subheader("Geçmiş Çalışmalar")
